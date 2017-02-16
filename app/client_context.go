@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,6 +24,7 @@ type clientContext struct {
 	command    *exec.Cmd
 	pty        *os.File
 	writeMutex *sync.Mutex
+	subdomain  *Subdomain
 }
 
 const (
@@ -74,10 +74,10 @@ func (context *clientContext) goHandleClient() {
 			connections := atomic.AddInt64(context.app.connections, -1)
 
 			if context.app.options.MaxConnection != 0 {
-				log.Printf("Connection closed: %s, connections: %d/%d",
+				log.Log("Connection closed: %s, connections: %d/%d",
 					context.request.RemoteAddr, connections, context.app.options.MaxConnection)
 			} else {
-				log.Printf("Connection closed: %s, connections: %d",
+				log.Log("Connection closed: %s, connections: %d",
 					context.request.RemoteAddr, connections)
 			}
 
@@ -100,7 +100,7 @@ func (context *clientContext) goHandleClient() {
 
 func (context *clientContext) processSend() {
 	if err := context.sendInitialize(); err != nil {
-		log.Printf(err.Error())
+		log.Log(err.Error())
 		return
 	}
 
@@ -109,12 +109,12 @@ func (context *clientContext) processSend() {
 	for {
 		size, err := context.pty.Read(buf)
 		if err != nil {
-			log.Printf("Command exited for: %s", context.request.RemoteAddr)
+			log.Log("Command exited for: %s", context.request.RemoteAddr)
 			return
 		}
 		safeMessage := base64.StdEncoding.EncodeToString([]byte(buf[:size]))
 		if err = context.write(append([]byte{Output}, []byte(safeMessage)...)); err != nil {
-			log.Printf(err.Error())
+			log.Log(err.Error())
 			return
 		}
 	}
@@ -129,7 +129,7 @@ func (context *clientContext) write(data []byte) error {
 func (context *clientContext) sendInitialize() error {
 	hostname, _ := os.Hostname()
 	titleVars := ContextVars{
-		Command:    strings.Join(context.app.command, " "),
+		Command:    strings.Join(context.subdomain.command, " "),
 		Pid:        context.command.Process.Pid,
 		Hostname:   hostname,
 		RemoteAddr: context.request.RemoteAddr,
@@ -173,11 +173,11 @@ func (context *clientContext) processReceive() {
 	for {
 		_, data, err := context.connection.ReadMessage()
 		if err != nil {
-			log.Print(err.Error())
+			log.Info(err.Error())
 			return
 		}
 		if len(data) == 0 {
-			log.Print("An error has occured")
+			log.Info("An error has occured")
 			return
 		}
 
@@ -194,14 +194,14 @@ func (context *clientContext) processReceive() {
 
 		case Ping:
 			if err := context.write([]byte{Pong}); err != nil {
-				log.Print(err.Error())
+				log.Info(err.Error())
 				return
 			}
 		case ResizeTerminal:
 			var args argResizeTerminal
 			err = json.Unmarshal(data[1:], &args)
 			if err != nil {
-				log.Print("Malformed remote command")
+				log.Info("Malformed remote command")
 				return
 			}
 
@@ -234,7 +234,7 @@ func (context *clientContext) processReceive() {
 			)
 
 		default:
-			log.Print("Unknown message type")
+			log.Info("Unknown message type")
 			return
 		}
 	}

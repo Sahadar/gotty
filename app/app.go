@@ -8,9 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io/ioutil"
-	"log"
 	"math/big"
 	"net"
+	"flag"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,7 +28,16 @@ import (
 	"github.com/kr/pty"
 	"github.com/yudai/hcl"
 	"github.com/yudai/umutex"
+
+	"github.com/Sahadar/logger-go"
 )
+
+var log *logger.Logger
+
+func init() {
+	log = logger.InitLogger()
+	flag.Parse()
+}
 
 type InitMessage struct {
 	Arguments string `json:"Arguments,omitempty"`
@@ -36,7 +45,6 @@ type InitMessage struct {
 }
 
 type App struct {
-	command []string
 	options *Options
 
 	upgrader *websocket.Upgrader
@@ -50,6 +58,13 @@ type App struct {
 	// clientContext writes concurrently
 	// Use atomic operations.
 	connections *int64
+}
+
+type Subdomain struct {
+	app *App
+
+	subdomain string
+	command []string
 }
 
 type Options struct {
@@ -81,6 +96,7 @@ type Options struct {
 }
 
 var Version = "0.0.13"
+var runningSubdomains []string
 
 var DefaultOptions = Options{
 	Address:             "",
@@ -107,7 +123,7 @@ var DefaultOptions = Options{
 	Height:              0,
 }
 
-func New(command []string, options *Options) (*App, error) {
+func New(options *Options) (*App, error) {
 	titleTemplate, err := template.New("title").Parse(options.TitleFormat)
 	if err != nil {
 		return nil, errors.New("Title format string syntax error")
@@ -116,7 +132,6 @@ func New(command []string, options *Options) (*App, error) {
 	connections := int64(0)
 
 	return &App{
-		command: command,
 		options: options,
 
 		upgrader: &websocket.Upgrader{
@@ -139,7 +154,7 @@ func ApplyConfigFile(options *Options, filePath string) error {
 	}
 
 	fileString := []byte{}
-	log.Printf("Loading config file at: %s", filePath)
+	log.Log("Loading config file at: %s", filePath)
 	fileString, err := ioutil.ReadFile(filePath)
 	if err != nil {
 		return err
@@ -159,13 +174,13 @@ func CheckConfig(options *Options) error {
 	return nil
 }
 
-func (app *App) Run() error {
+func (app *App) Run(subdomain string, command []string) error {
 	if app.options.PermitWrite {
-		log.Printf("Permitting clients to write input to the PTY.")
+		log.Log("Permitting clients to write input to the PTY.")
 	}
 
 	if app.options.Once {
-		log.Printf("Once option is provided, accepting only one client")
+		log.Log("Once option is provided, accepting only one client")
 	}
 
 	path := ""
@@ -174,8 +189,13 @@ func (app *App) Run() error {
 	}
 
 	endpoint := net.JoinHostPort(app.options.Address, app.options.Port)
+	sub := &Subdomain{
+		app : app,
+		subdomain : subdomain,
+		command : command,
+	}
 
-	wsHandler := http.HandlerFunc(app.handleWS)
+	wsHandler := http.HandlerFunc(sub.handleWS)
 	customIndexHandler := http.HandlerFunc(app.handleCustomIndex)
 	authTokenHandler := http.HandlerFunc(app.handleAuthToken)
 	staticHandler := http.FileServer(
@@ -185,7 +205,7 @@ func (app *App) Run() error {
 	var siteMux = http.NewServeMux()
 
 	if app.options.IndexFile != "" {
-		log.Printf("Using index file at " + app.options.IndexFile)
+		log.Log("Using index file at " + app.options.IndexFile)
 		siteMux.Handle(path+"/", customIndexHandler)
 	} else {
 		siteMux.Handle(path+"/", http.StripPrefix(path+"/", staticHandler))
@@ -197,7 +217,7 @@ func (app *App) Run() error {
 	siteHandler := http.Handler(siteMux)
 
 	if app.options.EnableBasicAuth {
-		log.Printf("Using Basic Authentication")
+		log.Log("Using Basic Authentication")
 		siteHandler = wrapBasicAuth(siteHandler, app.options.Credential)
 	}
 
@@ -214,18 +234,18 @@ func (app *App) Run() error {
 	if app.options.EnableTLS {
 		scheme = "https"
 	}
-	log.Printf(
+	log.Log(
 		"Server is starting with command: %s",
-		strings.Join(app.command, " "),
+		strings.Join(sub.command, " "),
 	)
 	if app.options.Address != "" {
-		log.Printf(
+		log.Log(
 			"URL: %s",
 			(&url.URL{Scheme: scheme, Host: endpoint, Path: path + "/"}).String(),
 		)
 	} else {
 		for _, address := range listAddresses() {
-			log.Printf(
+			log.Log(
 				"URL: %s",
 				(&url.URL{
 					Scheme: scheme,
@@ -255,8 +275,8 @@ func (app *App) Run() error {
 	if app.options.EnableTLS {
 		crtFile := ExpandHomeDir(app.options.TLSCrtFile)
 		keyFile := ExpandHomeDir(app.options.TLSKeyFile)
-		log.Printf("TLS crt file: " + crtFile)
-		log.Printf("TLS key file: " + keyFile)
+		log.Log("TLS crt file: " + crtFile)
+		log.Log("TLS key file: " + keyFile)
 
 		err = app.server.ListenAndServeTLS(crtFile, keyFile)
 	} else {
@@ -266,10 +286,14 @@ func (app *App) Run() error {
 		return err
 	}
 
-	log.Printf("Exiting...")
+	log.Log("Exiting...")
 
 	return nil
 }
+
+// func (app *App) handleSubdomain(subdomain string) (error) {
+// 	return error.Error("sddsds")
+// }
 
 func (app *App) makeServer(addr string, handler *http.Handler) (*http.Server, error) {
 	server := &http.Server{
@@ -279,7 +303,7 @@ func (app *App) makeServer(addr string, handler *http.Handler) (*http.Server, er
 
 	if app.options.EnableTLSClientAuth {
 		caFile := ExpandHomeDir(app.options.TLSCACrtFile)
-		log.Printf("CA file: " + caFile)
+		log.Log("CA file: " + caFile)
 		caCert, err := ioutil.ReadFile(caFile)
 		if err != nil {
 			return nil, errors.New("Could not open CA crt file " + caFile)
@@ -310,32 +334,33 @@ func (app *App) restartTimer() {
 	}
 }
 
-func (app *App) handleWS(w http.ResponseWriter, r *http.Request) {
-	app.stopTimer()
+func (subdomain *Subdomain) handleWS(w http.ResponseWriter, request *http.Request) {
+	subdomain.app.stopTimer()
 
-	connections := atomic.AddInt64(app.connections, 1)
-	if int64(app.options.MaxConnection) != 0 {
-		if connections >= int64(app.options.MaxConnection) {
-			log.Printf("Reached max connection: %d", app.options.MaxConnection)
+	log.Info(subdomain.subdomain)
+	connections := atomic.AddInt64(subdomain.app.connections, 1)
+	if int64(subdomain.app.options.MaxConnection) != 0 {
+		if connections >= int64(subdomain.app.options.MaxConnection) {
+			log.Log("Reached max connection: %d", subdomain.app.options.MaxConnection)
 			return
 		}
 	}
-	log.Printf("New client connected: %s", r.RemoteAddr)
+	log.Log("New client connected: %s", request.RemoteAddr)
 
-	if r.Method != "GET" {
+	if request.Method != "GET" {
 		http.Error(w, "Method not allowed", 405)
 		return
 	}
 
-	conn, err := app.upgrader.Upgrade(w, r, nil)
+	conn, err := subdomain.app.upgrader.Upgrade(w, request, nil)
 	if err != nil {
-		log.Print("Failed to upgrade connection: " + err.Error())
+		log.Info("Failed to upgrade connection: " + err.Error())
 		return
 	}
 
 	_, stream, err := conn.ReadMessage()
 	if err != nil {
-		log.Print("Failed to authenticate websocket connection")
+		log.Info("Failed to authenticate websocket connection")
 		conn.Close()
 		return
 	}
@@ -343,63 +368,48 @@ func (app *App) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	err = json.Unmarshal(stream, &init)
 	if err != nil {
-		log.Printf("Failed to parse init message %v", err)
+		log.Log("Failed to parse init message %v", err)
 		conn.Close()
 		return
 	}
-	if init.AuthToken != app.options.Credential {
-		log.Print("Failed to authenticate websocket connection")
+	if init.AuthToken != subdomain.app.options.Credential {
+		log.Info("Failed to authenticate websocket connection")
 		conn.Close()
 		return
 	}
-	argv := app.command[1:]
-	if app.options.PermitArguments {
-		if init.Arguments == "" {
-			init.Arguments = "?"
-		}
-		query, err := url.Parse(init.Arguments)
-		if err != nil {
-			log.Print("Failed to parse arguments")
-			conn.Close()
-			return
-		}
-		params := query.Query()["arg"]
-		if len(params) != 0 {
-			argv = append(argv, params...)
-		}
-	}
 
-	app.server.StartRoutine()
+	subdomain.app.server.StartRoutine()
 
-	if app.options.Once {
-		if app.onceMutex.TryLock() { // no unlock required, it will die soon
-			log.Printf("Last client accepted, closing the listener.")
-			app.server.Close()
+	if subdomain.app.options.Once {
+		if subdomain.app.onceMutex.TryLock() { // no unlock required, it will die soon
+			log.Log("Last client accepted, closing the listener.")
+			subdomain.app.server.Close()
 		} else {
-			log.Printf("Server is already closing.")
+			log.Log("Server is already closing.")
 			conn.Close()
 			return
 		}
 	}
 
-	cmd := exec.Command(app.command[0], argv...)
+	cmd := exec.Command(subdomain.command[0], subdomain.command[1:]...)
 	ptyIo, err := pty.Start(cmd)
 	if err != nil {
-		log.Print("Failed to execute command")
+		log.Info("Failed to execute command")
 		return
 	}
 
-	if app.options.MaxConnection != 0 {
-		log.Printf("Command is running for client %s with PID %d (args=%q), connections: %d/%d",
-			r.RemoteAddr, cmd.Process.Pid, strings.Join(argv, " "), connections, app.options.MaxConnection)
+	if subdomain.app.options.MaxConnection != 0 {
+		log.Log("Command is running for client %s with PID %d (args=%q), connections: %d/%d",
+			request.RemoteAddr, cmd.Process.Pid, strings.Join(subdomain.command, " "), connections, subdomain.app.options.MaxConnection)
 	} else {
-		log.Printf("Command is running for client %s with PID %d (args=%q), connections: %d",
-			r.RemoteAddr, cmd.Process.Pid, strings.Join(argv, " "), connections)
+		log.Log("Command is running for client %s with PID %d (args=%q), connections: %d",
+			request.RemoteAddr, cmd.Process.Pid, strings.Join(subdomain.command, " "), connections)
 	}
 
 	context := &clientContext{
-		app:        app,
-		request:    r,
+		app:        subdomain.app,
+		subdomain : subdomain,
+		request:    request,
 		connection: conn,
 		command:    cmd,
 		pty:        ptyIo,
@@ -422,7 +432,7 @@ func (app *App) Exit() (firstCall bool) {
 	if app.server != nil {
 		firstCall = app.server.Close()
 		if firstCall {
-			log.Printf("Received Exit command, waiting for all clients to close sessions...")
+			log.Log("Received Exit command, waiting for all clients to close sessions...")
 		}
 		return firstCall
 	}
@@ -433,7 +443,7 @@ func wrapLogger(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rw := &responseWrapper{w, 200}
 		handler.ServeHTTP(rw, r)
-		log.Printf("%s %d %s %s", r.RemoteAddr, rw.status, r.Method, r.URL.Path)
+		log.Log("%s %d %s %s", r.RemoteAddr, rw.status, r.Method, r.URL.Path)
 	})
 }
 
@@ -466,7 +476,7 @@ func wrapBasicAuth(handler http.Handler, credential string) http.Handler {
 			return
 		}
 
-		log.Printf("Basic Authentication Succeeded: %s", r.RemoteAddr)
+		log.Log("Basic Authentication Succeeded: %s", r.RemoteAddr)
 		handler.ServeHTTP(w, r)
 	})
 }
