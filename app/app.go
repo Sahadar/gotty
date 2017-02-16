@@ -20,7 +20,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"text/template"
-	"time"
 
 	"github.com/braintree/manners"
 	"github.com/elazarl/go-bindata-assetfs"
@@ -33,11 +32,6 @@ import (
 )
 
 var log *logger.Logger
-
-func init() {
-	log = logger.InitLogger()
-	flag.Parse()
-}
 
 type InitMessage struct {
 	Arguments string `json:"Arguments,omitempty"`
@@ -53,7 +47,6 @@ type App struct {
 	titleTemplate *template.Template
 
 	onceMutex *umutex.UnblockingMutex
-	timer     *time.Timer
 
 	// clientContext writes concurrently
 	// Use atomic operations.
@@ -86,7 +79,6 @@ type Options struct {
 	ReconnectTime       int                    `hcl:"reconnect_time"`
 	MaxConnection       int                    `hcl:"max_connection"`
 	Once                bool                   `hcl:"once"`
-	Timeout             int                    `hcl:"timeout"`
 	PermitArguments     bool                   `hcl:"permit_arguments"`
 	CloseSignal         int                    `hcl:"close_signal"`
 	Preferences         HtermPrefernces        `hcl:"preferences"`
@@ -96,7 +88,14 @@ type Options struct {
 }
 
 var Version = "0.0.13"
-var runningSubdomains []string
+var runningSubdomains map[string]*Subdomain
+var appSingleton *App
+
+func init() {
+	log = logger.InitLogger()
+	flag.Parse()
+	runningSubdomains = make(map[string]*Subdomain)
+}
 
 var DefaultOptions = Options{
 	Address:             "",
@@ -123,15 +122,19 @@ var DefaultOptions = Options{
 	Height:              0,
 }
 
-func New(options *Options) (*App, error) {
+func New(options *Options) (error) {
 	titleTemplate, err := template.New("title").Parse(options.TitleFormat)
 	if err != nil {
-		return nil, errors.New("Title format string syntax error")
+		return errors.New("Title format string syntax error")
 	}
-
 	connections := int64(0)
 
-	return &App{
+	if(appSingleton != nil) {
+		log.Log("Application already running.")
+		return nil
+	}
+
+	appSingleton = &App{
 		options: options,
 
 		upgrader: &websocket.Upgrader{
@@ -144,7 +147,107 @@ func New(options *Options) (*App, error) {
 
 		onceMutex:   umutex.New(),
 		connections: &connections,
-	}, nil
+	}
+
+	if appSingleton.options.PermitWrite {
+		log.Log("Permitting clients to write input to the PTY.")
+	}
+
+	if appSingleton.options.Once {
+		log.Log("Once option is provided, accepting only one client")
+	}
+
+	path := ""
+	if appSingleton.options.EnableRandomUrl {
+		path += "/" + generateRandomString(appSingleton.options.RandomUrlLength)
+	}
+
+	endpoint := net.JoinHostPort(appSingleton.options.Address, appSingleton.options.Port)
+
+
+	wsHandler := http.HandlerFunc(handleWS)
+	customIndexHandler := http.HandlerFunc(appSingleton.handleCustomIndex)
+	authTokenHandler := http.HandlerFunc(appSingleton.handleAuthToken)
+	staticHandler := http.FileServer(
+		&assetfs.AssetFS{Asset: Asset, AssetDir: AssetDir, Prefix: "static"},
+	)
+
+	var siteMux = http.NewServeMux()
+
+	if appSingleton.options.IndexFile != "" {
+		log.Log("Using index file at " + appSingleton.options.IndexFile)
+		siteMux.Handle(path+"/", customIndexHandler)
+	} else {
+		siteMux.Handle(path+"/", http.StripPrefix(path+"/", staticHandler))
+	}
+	siteMux.Handle(path+"/auth_token.js", authTokenHandler)
+	siteMux.Handle(path+"/js/", http.StripPrefix(path+"/", staticHandler))
+	siteMux.Handle(path+"/favicon.png", http.StripPrefix(path+"/", staticHandler))
+
+	siteHandler := http.Handler(siteMux)
+
+	if appSingleton.options.EnableBasicAuth {
+		log.Log("Using Basic Authentication")
+		siteHandler = wrapBasicAuth(siteHandler, appSingleton.options.Credential)
+	}
+
+	siteHandler = wrapHeaders(siteHandler)
+
+	wsMux := http.NewServeMux()
+	wsMux.Handle("/", siteHandler)
+	wsMux.Handle(path+"/ws", wsHandler)
+	siteHandler = (http.Handler(wsMux))
+
+	siteHandler = wrapLogger(siteHandler)
+
+	scheme := "http"
+	if appSingleton.options.EnableTLS {
+		scheme = "https"
+	}
+
+	if appSingleton.options.Address != "" {
+		log.Log(
+			"URL: %s",
+			(&url.URL{Scheme: scheme, Host: endpoint, Path: path + "/"}).String(),
+		)
+	} else {
+		for _, address := range listAddresses() {
+			log.Log(
+				"URL: %s",
+				(&url.URL{
+					Scheme: scheme,
+					Host:   net.JoinHostPort(address, appSingleton.options.Port),
+					Path:   path + "/",
+				}).String(),
+			)
+		}
+	}
+
+	server, err := appSingleton.makeServer(endpoint, &siteHandler)
+	if err != nil {
+		return errors.New("Failed to build server: " + err.Error())
+	}
+	appSingleton.server = manners.NewWithServer(
+		server,
+	)
+
+	if appSingleton.options.EnableTLS {
+		crtFile := ExpandHomeDir(appSingleton.options.TLSCrtFile)
+		keyFile := ExpandHomeDir(appSingleton.options.TLSKeyFile)
+		log.Log("TLS crt file: " + crtFile)
+		log.Log("TLS key file: " + keyFile)
+
+		err = appSingleton.server.ListenAndServeTLS(crtFile, keyFile)
+	} else {
+		err = appSingleton.server.ListenAndServe()
+	}
+	if err != nil {
+		return err
+	}
+
+	log.Log("Exiting...")
+
+	return nil
 }
 
 func ApplyConfigFile(options *Options, filePath string) error {
@@ -174,119 +277,14 @@ func CheckConfig(options *Options) error {
 	return nil
 }
 
-func (app *App) Run(subdomain string, command []string) error {
-	if app.options.PermitWrite {
-		log.Log("Permitting clients to write input to the PTY.")
-	}
-
-	if app.options.Once {
-		log.Log("Once option is provided, accepting only one client")
-	}
-
-	path := ""
-	if app.options.EnableRandomUrl {
-		path += "/" + generateRandomString(app.options.RandomUrlLength)
-	}
-
-	endpoint := net.JoinHostPort(app.options.Address, app.options.Port)
+func Run(subdomain string, command []string) error {
 	sub := &Subdomain{
-		app : app,
+		app : appSingleton,
 		subdomain : subdomain,
 		command : command,
 	}
 
-	wsHandler := http.HandlerFunc(sub.handleWS)
-	customIndexHandler := http.HandlerFunc(app.handleCustomIndex)
-	authTokenHandler := http.HandlerFunc(app.handleAuthToken)
-	staticHandler := http.FileServer(
-		&assetfs.AssetFS{Asset: Asset, AssetDir: AssetDir, Prefix: "static"},
-	)
-
-	var siteMux = http.NewServeMux()
-
-	if app.options.IndexFile != "" {
-		log.Log("Using index file at " + app.options.IndexFile)
-		siteMux.Handle(path+"/", customIndexHandler)
-	} else {
-		siteMux.Handle(path+"/", http.StripPrefix(path+"/", staticHandler))
-	}
-	siteMux.Handle(path+"/auth_token.js", authTokenHandler)
-	siteMux.Handle(path+"/js/", http.StripPrefix(path+"/", staticHandler))
-	siteMux.Handle(path+"/favicon.png", http.StripPrefix(path+"/", staticHandler))
-
-	siteHandler := http.Handler(siteMux)
-
-	if app.options.EnableBasicAuth {
-		log.Log("Using Basic Authentication")
-		siteHandler = wrapBasicAuth(siteHandler, app.options.Credential)
-	}
-
-	siteHandler = wrapHeaders(siteHandler)
-
-	wsMux := http.NewServeMux()
-	wsMux.Handle("/", siteHandler)
-	wsMux.Handle(path+"/ws", wsHandler)
-	siteHandler = (http.Handler(wsMux))
-
-	siteHandler = wrapLogger(siteHandler)
-
-	scheme := "http"
-	if app.options.EnableTLS {
-		scheme = "https"
-	}
-	log.Log(
-		"Server is starting with command: %s",
-		strings.Join(sub.command, " "),
-	)
-	if app.options.Address != "" {
-		log.Log(
-			"URL: %s",
-			(&url.URL{Scheme: scheme, Host: endpoint, Path: path + "/"}).String(),
-		)
-	} else {
-		for _, address := range listAddresses() {
-			log.Log(
-				"URL: %s",
-				(&url.URL{
-					Scheme: scheme,
-					Host:   net.JoinHostPort(address, app.options.Port),
-					Path:   path + "/",
-				}).String(),
-			)
-		}
-	}
-
-	server, err := app.makeServer(endpoint, &siteHandler)
-	if err != nil {
-		return errors.New("Failed to build server: " + err.Error())
-	}
-	app.server = manners.NewWithServer(
-		server,
-	)
-
-	if app.options.Timeout > 0 {
-		app.timer = time.NewTimer(time.Duration(app.options.Timeout) * time.Second)
-		go func() {
-			<-app.timer.C
-			app.Exit()
-		}()
-	}
-
-	if app.options.EnableTLS {
-		crtFile := ExpandHomeDir(app.options.TLSCrtFile)
-		keyFile := ExpandHomeDir(app.options.TLSKeyFile)
-		log.Log("TLS crt file: " + crtFile)
-		log.Log("TLS key file: " + keyFile)
-
-		err = app.server.ListenAndServeTLS(crtFile, keyFile)
-	} else {
-		err = app.server.ListenAndServe()
-	}
-	if err != nil {
-		return err
-	}
-
-	log.Log("Exiting...")
+	runningSubdomains[subdomain] = sub
 
 	return nil
 }
@@ -322,22 +320,17 @@ func (app *App) makeServer(addr string, handler *http.Handler) (*http.Server, er
 	return server, nil
 }
 
-func (app *App) stopTimer() {
-	if app.options.Timeout > 0 {
-		app.timer.Stop()
+func handleWS(w http.ResponseWriter, request *http.Request) {
+	log.Dump(request)
+
+	domainParts := strings.Split(request.Host, ".")
+	subdomain, ok := runningSubdomains[domainParts[0]]
+
+	if( ok != true ) {
+		log.Error("No such domain: ", domainParts[0])
+		return
 	}
-}
 
-func (app *App) restartTimer() {
-	if app.options.Timeout > 0 {
-		app.timer.Reset(time.Duration(app.options.Timeout) * time.Second)
-	}
-}
-
-func (subdomain *Subdomain) handleWS(w http.ResponseWriter, request *http.Request) {
-	subdomain.app.stopTimer()
-
-	log.Info(subdomain.subdomain)
 	connections := atomic.AddInt64(subdomain.app.connections, 1)
 	if int64(subdomain.app.options.MaxConnection) != 0 {
 		if connections >= int64(subdomain.app.options.MaxConnection) {
@@ -428,9 +421,9 @@ func (app *App) handleAuthToken(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("var gotty_auth_token = '" + app.options.Credential + "';"))
 }
 
-func (app *App) Exit() (firstCall bool) {
-	if app.server != nil {
-		firstCall = app.server.Close()
+func Exit() (firstCall bool) {
+	if appSingleton.server != nil {
+		firstCall = appSingleton.server.Close()
 		if firstCall {
 			log.Log("Received Exit command, waiting for all clients to close sessions...")
 		}

@@ -80,10 +80,6 @@ func (context *clientContext) goHandleClient() {
 				log.Log("Connection closed: %s, connections: %d",
 					context.request.RemoteAddr, connections)
 			}
-
-			if connections == 0 {
-				context.app.restartTimer()
-			}
 		}()
 
 		<-exit
