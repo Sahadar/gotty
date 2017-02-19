@@ -321,8 +321,7 @@ func (app *App) makeServer(addr string, handler *http.Handler) (*http.Server, er
 }
 
 func handleWS(w http.ResponseWriter, request *http.Request) {
-	log.Dump(request)
-
+	// log.Dump(request)
 	domainParts := strings.Split(request.Host, ".")
 	subdomain, ok := runningSubdomains[domainParts[0]]
 
