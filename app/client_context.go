@@ -53,8 +53,9 @@ type ContextVars struct {
 	RemoteAddr string
 }
 
-func (context *clientContext) goHandleClient() {
+func (context *clientContext) goHandleClient() (chan bool) {
 	exit := make(chan bool, 2)
+	handleClientExit := make(chan bool, 1)
 
 	go func() {
 		defer func() { exit <- true }()
@@ -71,7 +72,7 @@ func (context *clientContext) goHandleClient() {
 	go func() {
 		defer context.app.server.FinishRoutine()
 		defer func() {
-			connections := atomic.AddInt64(context.app.connections, -1)
+			connections := atomic.AddInt64(context.subdomain.connections, -1)
 
 			if context.app.options.MaxConnection != 0 {
 				log.Log("Connection closed: %s, connections: %d/%d",
@@ -91,7 +92,12 @@ func (context *clientContext) goHandleClient() {
 
 		context.command.Wait()
 		context.connection.Close()
+
+		handleClientExit <-true
+		close(handleClientExit)
 	}()
+
+	return handleClientExit
 }
 
 func (context *clientContext) processSend() {
@@ -169,7 +175,7 @@ func (context *clientContext) processReceive() {
 	for {
 		_, data, err := context.connection.ReadMessage()
 		if err != nil {
-			log.Info(err.Error())
+			log.Error(err.Error())
 			return
 		}
 		if len(data) == 0 {
@@ -190,7 +196,7 @@ func (context *clientContext) processReceive() {
 
 		case Ping:
 			if err := context.write([]byte{Pong}); err != nil {
-				log.Info(err.Error())
+				log.Error(err.Error())
 				return
 			}
 		case ResizeTerminal:

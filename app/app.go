@@ -47,10 +47,6 @@ type App struct {
 	titleTemplate *template.Template
 
 	onceMutex *umutex.UnblockingMutex
-
-	// clientContext writes concurrently
-	// Use atomic operations.
-	connections *int64
 }
 
 type Subdomain struct {
@@ -58,6 +54,9 @@ type Subdomain struct {
 
 	subdomain string
 	command []string
+	// clientContext writes concurrently
+	// Use atomic operations.
+	connections *int64
 }
 
 type Options struct {
@@ -127,7 +126,6 @@ func New(options *Options) (error) {
 	if err != nil {
 		return errors.New("Title format string syntax error")
 	}
-	connections := int64(0)
 
 	if(appSingleton != nil) {
 		log.Log("Application already running.")
@@ -146,7 +144,6 @@ func New(options *Options) (error) {
 		titleTemplate: titleTemplate,
 
 		onceMutex:   umutex.New(),
-		connections: &connections,
 	}
 
 	if appSingleton.options.PermitWrite {
@@ -278,10 +275,13 @@ func CheckConfig(options *Options) error {
 }
 
 func Run(subdomain string, command []string) error {
+	connections := int64(0)
+
 	sub := &Subdomain{
 		app : appSingleton,
 		subdomain : subdomain,
 		command : command,
+		connections: &connections,
 	}
 
 	runningSubdomains[subdomain] = sub
@@ -330,7 +330,7 @@ func handleWS(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	connections := atomic.AddInt64(subdomain.app.connections, 1)
+	connections := atomic.AddInt64(subdomain.connections, 1)
 	if int64(subdomain.app.options.MaxConnection) != 0 {
 		if connections >= int64(subdomain.app.options.MaxConnection) {
 			log.Log("Reached max connection: %d", subdomain.app.options.MaxConnection)
@@ -408,7 +408,10 @@ func handleWS(w http.ResponseWriter, request *http.Request) {
 		writeMutex: &sync.Mutex{},
 	}
 
-	context.goHandleClient()
+	channel := context.goHandleClient()
+	<-channel
+
+	log.Info("Connections: ", int64(*subdomain.connections))
 }
 
 func (app *App) handleCustomIndex(w http.ResponseWriter, r *http.Request) {
