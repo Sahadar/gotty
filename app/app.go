@@ -326,7 +326,7 @@ func (app *App) makeServer(addr string, handler *http.Handler) (*http.Server, er
 }
 
 func handleWS(w http.ResponseWriter, request *http.Request) {
-	// log.Dump(request)
+
 	domainParts := strings.Split(request.Host, ".")
 	subdomain, ok := runningSubdomains[domainParts[0]]
 
@@ -351,13 +351,13 @@ func handleWS(w http.ResponseWriter, request *http.Request) {
 
 	conn, err := subdomain.app.upgrader.Upgrade(w, request, nil)
 	if err != nil {
-		log.Info("Failed to upgrade connection: " + err.Error())
+		log.Error("Failed to upgrade connection: " + err.Error())
 		return
 	}
 
 	_, stream, err := conn.ReadMessage()
 	if err != nil {
-		log.Info("Failed to authenticate websocket connection")
+		log.Error("Failed to authenticate websocket connection")
 		conn.Close()
 		return
 	}
@@ -370,7 +370,7 @@ func handleWS(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if init.AuthToken != subdomain.app.options.Credential {
-		log.Info("Failed to authenticate websocket connection")
+		log.Error("Failed to authenticate websocket connection")
 		conn.Close()
 		return
 	}
@@ -391,7 +391,7 @@ func handleWS(w http.ResponseWriter, request *http.Request) {
 	cmd := exec.Command(subdomain.command[0], subdomain.command[1:]...)
 	ptyIo, err := pty.Start(cmd)
 	if err != nil {
-		log.Info("Failed to execute command")
+		log.Error("Failed to execute command")
 		return
 	}
 
@@ -413,15 +413,17 @@ func handleWS(w http.ResponseWriter, request *http.Request) {
 		writeMutex: &sync.Mutex{},
 	}
 
-	channel := context.goHandleClient()
-	<-channel
+	go func() {
+		channel := context.goHandleClient()
+		<-channel
 
-	if( int64(*subdomain.connections) == 0 ) {
-		Emitter.Publish("close", map[string]interface{}{
-			"subdomain"  : subdomain.subdomain,
-		})
-	}
-	log.Info("Connections: ", int64(*subdomain.connections))
+		if( int64(*subdomain.connections) == 0 ) {
+			Emitter.Publish("close", map[string]interface{}{
+				"subdomain"  : subdomain.subdomain,
+			})
+		}
+		log.Info("Connections: ", int64(*subdomain.connections))
+	}()
 }
 
 func (app *App) handleCustomIndex(w http.ResponseWriter, r *http.Request) {
@@ -448,7 +450,7 @@ func wrapLogger(handler http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rw := &responseWrapper{w, 200}
 		handler.ServeHTTP(rw, r)
-		log.Log("%s %d %s %s", r.RemoteAddr, rw.status, r.Method, r.URL.Path)
+		log.Info(r.RemoteAddr, rw.status, r.Method, r.URL.Path)
 	})
 }
 
