@@ -29,8 +29,12 @@ import (
 	"github.com/yudai/umutex"
 
 	"github.com/Sahadar/logger-go"
+	"github.com/tiny-libs/tiny-pubsub-golang"
 )
 
+
+
+var Emitter *pubsub.Pubsub
 var log *logger.Logger
 
 type InitMessage struct {
@@ -92,6 +96,7 @@ var appSingleton *App
 
 func init() {
 	log = logger.InitLogger()
+	Emitter = pubsub.NewPubsub()
 	flag.Parse()
 	runningSubdomains = make(map[string]*Subdomain)
 }
@@ -411,6 +416,11 @@ func handleWS(w http.ResponseWriter, request *http.Request) {
 	channel := context.goHandleClient()
 	<-channel
 
+	if( int64(*subdomain.connections) == 0 ) {
+		Emitter.Publish("close", map[string]interface{}{
+			"subdomain"  : subdomain.subdomain,
+		})
+	}
 	log.Info("Connections: ", int64(*subdomain.connections))
 }
 
