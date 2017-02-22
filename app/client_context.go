@@ -85,13 +85,13 @@ func (context *clientContext) goHandleClient() (chan bool) {
 
 		<-exit
 		context.pty.Close()
+		context.connection.Close()
+		log.Info("!!connection close!!")
 
 		// Even if the PTY has been closed,
 		// Read(0 in processSend() keeps blocking and the process doen't exit
 		context.command.Process.Signal(syscall.Signal(context.app.options.CloseSignal))
-
 		context.command.Wait()
-		context.connection.Close()
 
 		handleClientExit <-true
 		close(handleClientExit)

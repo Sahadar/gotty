@@ -96,7 +96,7 @@ var appSingleton *App
 
 func init() {
 	log = logger.InitLogger()
-	Emitter = pubsub.NewPubsub()
+	Emitter = pubsub.NewPubsub(true)
 	flag.Parse()
 	runningSubdomains = make(map[string]*Subdomain)
 }
