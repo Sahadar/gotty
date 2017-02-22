@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"text/template"
+	"time"
 
 	"github.com/braintree/manners"
 	"github.com/elazarl/go-bindata-assetfs"
@@ -279,7 +280,7 @@ func CheckConfig(options *Options) error {
 	return nil
 }
 
-func Run(subdomain string, command []string) error {
+func Run(subdomain string, command []string) (*Subdomain) {
 	connections := int64(0)
 
 	sub := &Subdomain{
@@ -291,7 +292,7 @@ func Run(subdomain string, command []string) error {
 
 	runningSubdomains[subdomain] = sub
 
-	return nil
+	return sub
 }
 
 // func (app *App) handleSubdomain(subdomain string) (error) {
@@ -418,9 +419,18 @@ func handleWS(w http.ResponseWriter, request *http.Request) {
 		<-channel
 
 		if( int64(*subdomain.connections) == 0 ) {
-			Emitter.Publish("close", map[string]interface{}{
-				"subdomain"  : subdomain.subdomain,
-			})
+			// check if in 15 seconds it will be used
+			timer := time.NewTimer(time.Duration(15) * time.Second)
+
+			go func() {
+				<- timer.C
+
+				if( int64(*subdomain.connections) == 0 ) {
+					Emitter.Publish("close", map[string]interface{}{
+						"subdomain"  : subdomain.subdomain,
+					})
+				}
+			}()
 		}
 		log.Info("Connections: ", int64(*subdomain.connections))
 	}()
